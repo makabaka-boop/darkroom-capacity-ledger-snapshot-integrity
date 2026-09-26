@@ -2,7 +2,9 @@
  * 药液处理容量台账的 localStorage 持久化与跨标签并发控制。
  *
  * 批次与使用记录整体存为一个 JSON 文档；读取时逐字段校验结构，
- * 损坏或版本不符的数据一律视为不可信，绝不让异常进入界面。
+ * 并校验容量轨迹一致性（批次 id 唯一、每批累计用量不超过额定容量、
+ * 每条记录的登记后剩余量与累计用量吻合）。损坏、版本不符或轨迹矛盾的
+ * 数据一律视为不可信，绝不让异常进入界面，也不在其上继续写入。
  * 使用记录只追加不修改，因此这里也只提供整体读 / 写，不提供单条更新。
  *
  * 批次的配液来源快照（mixSource）是可选字段：旧数据没有它，照常读取；
@@ -25,6 +27,7 @@
 
 import {
   EMPTY_LEDGER,
+  hasConsistentCapacityTrajectory,
   isMixSourceSnapshot,
   recordUsage,
   createBatch,
@@ -164,7 +167,12 @@ export function parseLedger(json: string): LedgerState | null {
     if (!record || !batchIds.has(record.batchId)) return null;
     records.push(record);
   }
-  return { batches, records };
+  const state: LedgerState = { batches, records };
+  // 容量轨迹校验：同 id 批次、累计用量超额定容量、remainingAfter 与累计不符的
+  // 存档一律不可信——批次选择、历史余量与耗尽判断必须来自同一份可信容量轨迹，
+  // 否则交接班会看到互相矛盾的余量，异常存档还可能被后续写入当成正常台账覆盖。
+  if (!hasConsistentCapacityTrajectory(state)) return null;
+  return state;
 }
 
 /** 反序列化带修订号的完整文档；缺 revision 的旧版台账按 revision 0 接受。 */

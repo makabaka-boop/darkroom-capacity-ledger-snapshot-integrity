@@ -11,6 +11,8 @@
  *
  * 使用记录一旦写入不可修改：命令只追加、不更新、不删除；
  * 累计用量 / 剩余容量 / 状态均由记录推导，不单独存储。
+ * hasConsistentCapacityTrajectory 把这些推导不变量汇总为「容量轨迹一致性」校验，
+ * 供持久化层在还原存档时判定整份台账是否可信（详见 ledgerStorage.ts）。
  *
  * 配液来源快照（可选）：从配液计算结果区「存入容量台账」时，
  * 把同一次计算的稀释比例、目标总量、量筒容量、分罐数与浓缩液/清水体积
@@ -209,6 +211,36 @@ export function batchStatus(batch: ChemicalBatch, state: LedgerState): BatchStat
 /** 某批次的全部使用记录，按登记时间（写入顺序）排列。 */
 export function batchRecords(state: LedgerState, batchId: string): UsageRecord[] {
   return state.records.filter((record) => record.batchId === batchId);
+}
+
+/**
+ * 容量轨迹一致性校验（还原存档时的信任闸门）。
+ *
+ * 命令产出的台账恒满足以下不变量；从存储还原的存档若违反任意一条，
+ * 说明数据已被外部篡改或损坏——批次选择、历史余量与耗尽判断会互相矛盾，
+ * 这样的存档不得作为可信台账加载，更不得在其上继续写入：
+ * - 批次 id 唯一：同 id 出现两个批次时，同一组使用记录会被分别套到
+ *   两个额定容量上，药液归属无法确认；
+ * - 每个批次的记录按写入顺序重放，累计用量不超过额定容量（余量不为负）；
+ * - 每条记录的 remainingAfter 等于「额定容量 − 截至该条的累计用量」，
+ *   即历史明细与批次汇总来自同一份容量轨迹。
+ */
+export function hasConsistentCapacityTrajectory(state: LedgerState): boolean {
+  const seenIds = new Set<string>();
+  for (const batch of state.batches) {
+    if (seenIds.has(batch.id)) return false;
+    seenIds.add(batch.id);
+  }
+  for (const batch of state.batches) {
+    let used = 0;
+    for (const record of state.records) {
+      if (record.batchId !== batch.id) continue;
+      used += record.films;
+      if (used > batch.capacity) return false;
+      if (record.remainingAfter !== batch.capacity - used) return false;
+    }
+  }
+  return true;
 }
 
 export interface CreateBatchInput {
