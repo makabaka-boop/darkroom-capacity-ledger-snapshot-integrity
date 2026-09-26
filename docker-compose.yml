@@ -1,0 +1,25 @@
+services:
+  web:
+    build:
+      context: .
+      target: web
+    ports:
+      # 宿主端口可用 WEB_PORT 覆盖：WEB_PORT=8080 docker compose up web
+      - "${WEB_PORT:-5173}:80"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  verify:
+    build:
+      context: .
+      target: verify
+    profiles: ["verify"]
+    depends_on:
+      web:
+        condition: service_healthy
+    environment:
+      # 验收直接访问 compose 网络内的 web 服务
+      E2E_BASE_URL: http://web
