@@ -3,15 +3,19 @@ import {
   batchStatus,
   createBatch,
   EMPTY_LEDGER,
+  hasConsistentCapacityTrajectory,
   recordUsage,
   remainingCapacity,
   type LedgerDeps,
   type LedgerState,
 } from '../../src/lib/capacityLedger';
 import {
+  commitLedger,
   LEDGER_STORAGE_KEY,
   loadLedger,
+  loadLedgerDocument,
   parseLedger,
+  parseLedgerDocument,
   saveLedger,
   serializeLedger,
   type StorageLike,
@@ -170,5 +174,155 @@ describe('容量台账持久化', () => {
     // 已耗尽后第四次登记被拒绝
     const rejected = recordUsage(finalState, { batchId: created.value.id, films: '1' }, deps);
     expect(rejected.ok).toBe(false);
+  });
+});
+
+describe('容量轨迹一致性（异常存档与合法旧档）', () => {
+  /** 三种轨迹自相矛盾的存档：逐字段类型都合法，但容量轨迹不可信。 */
+  const ANOMALOUS_ARCHIVES: Array<[string, string]> = [
+    [
+      '两个同 id、不同额定容量的批次（同一组记录被套到两个容量上）',
+      JSON.stringify({
+        batches: [
+          { id: 'dup-batch', name: '显影液（甲）', capacity: 10, createdAt: '2026-09-01T08:00:00.000Z' },
+          { id: 'dup-batch', name: '显影液（乙）', capacity: 20, createdAt: '2026-09-01T08:05:00.000Z' },
+        ],
+        records: [
+          { id: 'r1', batchId: 'dup-batch', films: 4, note: '', remainingAfter: 6, createdAt: '2026-09-02T09:00:00.000Z' },
+        ],
+        revision: 2,
+      }),
+    ],
+    [
+      '累计用量超过额定容量的批次（负余量）',
+      JSON.stringify({
+        batches: [{ id: 'b1', name: '超用批次', capacity: 5, createdAt: '2026-09-01T08:00:00.000Z' }],
+        records: [
+          { id: 'r1', batchId: 'b1', films: 4, note: '', remainingAfter: 1, createdAt: '2026-09-02T09:00:00.000Z' },
+          { id: 'r2', batchId: 'b1', films: 3, note: '', remainingAfter: 0, createdAt: '2026-09-03T09:00:00.000Z' },
+        ],
+      }),
+    ],
+    [
+      '记录的登记后剩余量与累计用量不符（历史明细与批次汇总矛盾）',
+      JSON.stringify({
+        batches: [{ id: 'b1', name: '矛盾批次', capacity: 10, createdAt: '2026-09-01T08:00:00.000Z' }],
+        records: [
+          { id: 'r1', batchId: 'b1', films: 3, note: '', remainingAfter: 7, createdAt: '2026-09-02T09:00:00.000Z' },
+          { id: 'r2', batchId: 'b1', films: 2, note: '', remainingAfter: 4, createdAt: '2026-09-03T09:00:00.000Z' },
+        ],
+        revision: 1,
+      }),
+    ],
+  ];
+
+  it.each(ANOMALOUS_ARCHIVES)('异常存档不可信：%s', (_label, payload) => {
+    // 逐字段类型合法，但轨迹校验拒绝：解析与文档解析都返回 null
+    expect(parseLedger(payload)).toBeNull();
+    expect(parseLedgerDocument(payload)).toBeNull();
+
+    const storage = memoryStorage();
+    storage.setItem(LEDGER_STORAGE_KEY, payload);
+    // 加载视为损坏：报告 corrupted，台账回退为空，不作为可写台账
+    const load = loadLedgerDocument(storage);
+    expect(load.ok).toBe(false);
+    if (!load.ok) expect(load.corrupted).toBe(true);
+    expect(load.doc).toEqual({ ledger: EMPTY_LEDGER, revision: 0 });
+    expect(loadLedger(storage)).toEqual(EMPTY_LEDGER);
+  });
+
+  it.each(ANOMALOUS_ARCHIVES)('异常存档不被普通操作覆盖：%s', (_label, payload) => {
+    const storage = memoryStorage();
+    storage.setItem(LEDGER_STORAGE_KEY, payload);
+    const deps = testDeps();
+
+    // 创建批次被拒绝：存储原文一个字节都不变
+    const created = commitLedger(
+      storage,
+      loadLedgerDocument(storage).doc,
+      { type: 'createBatch', input: { name: '新批次', capacity: '8' } },
+      deps,
+    );
+    expect(created.ok).toBe(false);
+    if (!created.ok) expect(created.kind).toBe('corrupted');
+    expect(storage.dump().get(LEDGER_STORAGE_KEY)).toBe(payload);
+
+    // 登记用量同样被拒绝（即便指向存档中的批次 id），原文保持不动
+    const recorded = commitLedger(
+      storage,
+      loadLedgerDocument(storage).doc,
+      { type: 'recordUsage', input: { batchId: 'b1', films: '1' } },
+      deps,
+    );
+    expect(recorded.ok).toBe(false);
+    if (!recorded.ok) expect(recorded.kind).toBe('corrupted');
+    expect(storage.dump().get(LEDGER_STORAGE_KEY)).toBe(payload);
+  });
+
+  it('待写入状态轨迹不一致时，saveLedger 拒绝写入并保留原文', () => {
+    const storage = memoryStorage();
+    const good = buildLedger();
+    saveLedger(storage, good);
+    const before = storage.dump().get(LEDGER_STORAGE_KEY);
+
+    // 手工构造「登记后剩余量与累计不符」的脏状态（模拟旧版异常写出的台账）
+    const dirty: LedgerState = {
+      batches: good.batches,
+      records: good.records.map((record, index) =>
+        index === 0 ? { ...record, remainingAfter: record.remainingAfter + 1 } : record,
+      ),
+    };
+    expect(hasConsistentCapacityTrajectory(dirty)).toBe(false);
+    saveLedger(storage, dirty);
+    expect(storage.dump().get(LEDGER_STORAGE_KEY)).toBe(before);
+    expect(loadLedger(storage)).toEqual(good);
+  });
+
+  it('类型合法且容量轨迹一致的旧版无修订号存档正常恢复，登记后刷新还原同一台账', () => {
+    // 旧版存档：无 revision、无快照；两批三条记录，轨迹完全一致
+    const legacy = JSON.stringify({
+      batches: [
+        { id: 'legacy-dev', name: '旧版显影液', capacity: 10, createdAt: '2026-09-01T08:00:00.000Z' },
+        { id: 'legacy-fix', name: '旧版定影液', capacity: 5, createdAt: '2026-09-01T08:05:00.000Z' },
+      ],
+      records: [
+        { id: 'r1', batchId: 'legacy-dev', films: 4, note: '4 卷 135', remainingAfter: 6, createdAt: '2026-09-02T09:00:00.000Z' },
+        { id: 'r2', batchId: 'legacy-fix', films: 2, note: '', remainingAfter: 3, createdAt: '2026-09-02T10:00:00.000Z' },
+        { id: 'r3', batchId: 'legacy-dev', films: 6, note: '', remainingAfter: 0, createdAt: '2026-09-03T09:00:00.000Z' },
+      ],
+    });
+    const storage = memoryStorage();
+    storage.setItem(LEDGER_STORAGE_KEY, legacy);
+
+    // 正常恢复：修订号按 0 兼容，派生状态由同一轨迹给出
+    const load = loadLedgerDocument(storage);
+    expect(load.ok).toBe(true);
+    expect(load.doc.revision).toBe(0);
+    const [developer, fixer] = load.doc.ledger.batches;
+    expect(remainingCapacity(developer, load.doc.ledger)).toBe(0);
+    expect(batchStatus(developer, load.doc.ledger)).toBe('exhausted');
+    expect(remainingCapacity(fixer, load.doc.ledger)).toBe(3);
+    expect(batchStatus(fixer, load.doc.ledger)).toBe('active');
+
+    // 在旧档上登记：首次提交升级为带修订号文档，旧记录原样保留在前
+    const deps = testDeps();
+    const outcome = commitLedger(
+      storage,
+      load.doc,
+      { type: 'recordUsage', input: { batchId: 'legacy-fix', films: '1', note: '交接班登记' } },
+      deps,
+    );
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    expect(outcome.doc.revision).toBe(1);
+
+    // 模拟刷新：还原同一台账，记录集合、顺序与剩余量轨迹一致
+    const restored = loadLedgerDocument(storage);
+    expect(restored.ok).toBe(true);
+    expect(restored.doc).toEqual(outcome.doc);
+    expect(restored.doc.ledger.records.map((record) => record.films)).toEqual([4, 2, 6, 1]);
+    expect(restored.doc.ledger.records.map((record) => record.remainingAfter)).toEqual([6, 3, 0, 2]);
+    expect(restored.doc.ledger.records[3].note).toBe('交接班登记');
+    expect(remainingCapacity(fixer, restored.doc.ledger)).toBe(2);
   });
 });

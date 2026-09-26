@@ -8,6 +8,12 @@
  * 批次的配液来源快照（mixSource）是可选字段：旧数据没有它，照常读取；
  * 一旦出现就必须通过结构校验，否则整份数据视为不可信。
  *
+ * 结构之外，读取还会重放容量轨迹（hasConsistentCapacityTrajectory）：
+ * 批次 id 必须唯一、每批累计用量不得超过额定容量、每条记录的
+ * 登记后剩余量必须与按顺序累计的轨迹一致。轨迹自相矛盾的存档
+ * （同 id 批次、超额批次、余量与汇总矛盾的记录）同样视为不可信：
+ * 就地提示、不作为可写台账、也绝不写回覆盖浏览器中的原文。
+ *
  * 跨标签并发（本模块的核心职责）：
  * 持久化文档带一个单调递增的 revision（每次成功提交 +1）。
  * 提交动作（commitLedger）必须「先读最新文档 → 核对基准 revision →
@@ -25,6 +31,7 @@
 
 import {
   EMPTY_LEDGER,
+  hasConsistentCapacityTrajectory,
   isMixSourceSnapshot,
   recordUsage,
   createBatch,
@@ -164,7 +171,13 @@ export function parseLedger(json: string): LedgerState | null {
     if (!record || !batchIds.has(record.batchId)) return null;
     records.push(record);
   }
-  return { batches, records };
+  const state: LedgerState = { batches, records };
+  // 容量轨迹是批次选择、历史余量、耗尽判断与后续写入的唯一依据：
+  // 同 id 批次、超过额定容量的累计用量、与累计不符的登记后剩余量
+  // 都会让轨迹自相矛盾。这类存档即使逐字段类型合法也一律视为不可信
+  // （按损坏处理：就地提示、不作为可写台账、绝不写回覆盖原文）。
+  if (!hasConsistentCapacityTrajectory(state)) return null;
+  return state;
 }
 
 /** 反序列化带修订号的完整文档；缺 revision 的旧版台账按 revision 0 接受。 */

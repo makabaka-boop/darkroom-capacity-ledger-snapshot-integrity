@@ -5,6 +5,7 @@ import {
   batchStatus,
   createBatch,
   EMPTY_LEDGER,
+  hasConsistentCapacityTrajectory,
   recordUsage,
   remainingCapacity,
   usedCapacity,
@@ -311,5 +312,81 @@ describe('recordUsage 命令', () => {
     const times = records.map((record) => new Date(record.createdAt).getTime());
     expect(times[0]).toBeLessThan(times[1]);
     expect(times[1]).toBeLessThan(times[2]);
+  });
+});
+
+describe('hasConsistentCapacityTrajectory 容量轨迹校验', () => {
+  function batch(id: string, capacity: number): ChemicalBatch {
+    return { id, name: `批次 ${id}`, capacity, createdAt: '2026-09-01T08:00:00.000Z' };
+  }
+
+  function record(
+    id: string,
+    batchId: string,
+    films: number,
+    remainingAfter: number,
+  ): LedgerState['records'][number] {
+    return { id, batchId, films, note: '', remainingAfter, createdAt: '2026-09-02T09:00:00.000Z' };
+  }
+
+  it('空台账与无记录批次可信', () => {
+    expect(hasConsistentCapacityTrajectory(EMPTY_LEDGER)).toBe(true);
+    expect(hasConsistentCapacityTrajectory({ batches: [batch('b1', 10)], records: [] })).toBe(true);
+  });
+
+  it('命令产出的状态恒可信：跨批次交错记录也按各自轨迹重放', () => {
+    const deps = testDeps();
+    const a = mustCreate(EMPTY_LEDGER, '显影液', '10', deps);
+    const b = mustCreate(a.state, '定影液', '5', deps);
+    let state = b.state;
+    // 交错登记：A 4 → B 2 → A 6（A 恰好耗尽）
+    state = mustRecord(state, a.value.id, '4', deps).state;
+    state = mustRecord(state, b.value.id, '2', deps).state;
+    state = mustRecord(state, a.value.id, '6', deps).state;
+    expect(hasConsistentCapacityTrajectory(state)).toBe(true);
+    // 恰好耗尽（剩余 0）是合法轨迹
+    expect(remainingCapacity(a.value, state)).toBe(0);
+  });
+
+  it('同 id 批次不可信：同一组记录的归属无法确认', () => {
+    const state: LedgerState = {
+      batches: [batch('dup', 10), batch('dup', 20)],
+      records: [record('r1', 'dup', 4, 6)],
+    };
+    expect(hasConsistentCapacityTrajectory(state)).toBe(false);
+  });
+
+  it('累计用量超过额定容量（负余量）不可信', () => {
+    const state: LedgerState = {
+      batches: [batch('b1', 5)],
+      records: [record('r1', 'b1', 4, 1), record('r2', 'b1', 3, 0)],
+    };
+    expect(hasConsistentCapacityTrajectory(state)).toBe(false);
+  });
+
+  it('登记后剩余量与累计轨迹不符不可信（含中间某条不符）', () => {
+    // 单条即矛盾：10 − 3 = 7 ≠ 5
+    expect(
+      hasConsistentCapacityTrajectory({
+        batches: [batch('b1', 10)],
+        records: [record('r1', 'b1', 3, 5)],
+      }),
+    ).toBe(false);
+    // 前一条一致、后一条矛盾：10 − 3 = 7 ✓，7 − 2 = 5 ≠ 4 ✗
+    expect(
+      hasConsistentCapacityTrajectory({
+        batches: [batch('b1', 10)],
+        records: [record('r1', 'b1', 3, 7), record('r2', 'b1', 2, 4)],
+      }),
+    ).toBe(false);
+  });
+
+  it('记录挂在未知批次上不可信', () => {
+    expect(
+      hasConsistentCapacityTrajectory({
+        batches: [batch('b1', 10)],
+        records: [record('r1', 'ghost', 1, 9)],
+      }),
+    ).toBe(false);
   });
 });

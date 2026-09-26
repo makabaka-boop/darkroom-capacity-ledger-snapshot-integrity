@@ -11,6 +11,9 @@
  *
  * 使用记录一旦写入不可修改：命令只追加、不更新、不删除；
  * 累计用量 / 剩余容量 / 状态均由记录推导，不单独存储。
+ * hasConsistentCapacityTrajectory 校验一份状态能否按此轨迹完整重放，
+ * 持久化层据此拒绝加载自相矛盾的存档（同 id 批次、超额用量、
+ * 与累计不符的登记后剩余量）。
  *
  * 配液来源快照（可选）：从配液计算结果区「存入容量台账」时，
  * 把同一次计算的稀释比例、目标总量、量筒容量、分罐数与浓缩液/清水体积
@@ -201,14 +204,54 @@ export function remainingCapacity(batch: ChemicalBatch, state: LedgerState): num
   return batch.capacity - usedCapacity(state, batch.id);
 }
 
-/** 状态由剩余量推导：剩余为 0 即已耗尽，否则使用中。 */
+/**
+ * 状态由剩余量推导：剩余为 0 即已耗尽，否则使用中。
+ * 负剩余在可信台账中不会出现（见 hasConsistentCapacityTrajectory）；
+ * 即便如此也按已耗尽处理，绝不把已超用的药液标为「使用中」。
+ */
 export function batchStatus(batch: ChemicalBatch, state: LedgerState): BatchStatus {
-  return remainingCapacity(batch, state) === 0 ? 'exhausted' : 'active';
+  return remainingCapacity(batch, state) <= 0 ? 'exhausted' : 'active';
 }
 
 /** 某批次的全部使用记录，按登记时间（写入顺序）排列。 */
 export function batchRecords(state: LedgerState, batchId: string): UsageRecord[] {
   return state.records.filter((record) => record.batchId === batchId);
+}
+
+/**
+ * 容量轨迹一致性校验（持久化读取的最终闸门）。
+ *
+ * 批次选择、历史余量、耗尽判断与后续写入都依据同一份容量轨迹：
+ * 「剩余量 = 额定容量 − 已登记用量之和」，逐条记录重放可完整还原。
+ * 因此一份可信台账必须满足：
+ * - 批次 id 唯一：记录按 batchId 归属，同 id 的两个批次会让同一组
+ *   使用记录被分别套到两个额定容量上，药液归属无法确认；
+ * - 按存储顺序逐条重放每批记录时，任一时刻累计用量都不超过额定容量
+ *   （剩余量永不为负，不存在「已超用却仍显示使用中」的批次）；
+ * - 每条记录的 remainingAfter 等于重放到该条时的剩余量，
+ *   否则历史明细与批次汇总互相矛盾，整份台账失去可追溯性。
+ *
+ * 命令（createBatch / recordUsage）产出的状态恒满足本校验；
+ * 不满足的存档视为不可信：不得加载为可写台账，也不得被普通操作覆盖。
+ */
+export function hasConsistentCapacityTrajectory(state: LedgerState): boolean {
+  const remainingByBatchId = new Map<string, number>();
+  for (const batch of state.batches) {
+    if (remainingByBatchId.has(batch.id)) return false;
+    remainingByBatchId.set(batch.id, batch.capacity);
+  }
+  for (const record of state.records) {
+    const remaining = remainingByBatchId.get(record.batchId);
+    // 记录挂在未知批次上（存储层已先行校验，此处为双保险）
+    if (remaining === undefined) return false;
+    const next = remaining - record.films;
+    // 超额：累计用量超过额定容量，剩余量为负
+    if (next < 0) return false;
+    // 登记后剩余量与重放轨迹不符
+    if (record.remainingAfter !== next) return false;
+    remainingByBatchId.set(record.batchId, next);
+  }
+  return true;
 }
 
 export interface CreateBatchInput {
